@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,9 +30,9 @@ const (
 	redisPassword  = ""
 	redisDB        = 0
 
-	redisQueueMain      = "ci:tasks:main"
+	redisQueueMain       = "ci:tasks:main"
 	redisQueueProcessing = "ci:tasks:processing"
-	redisQueueDetails   = "ci:tasks:main:details:"
+	redisQueueDetails    = "ci:tasks:main:details:"
 
 	workDir    = "./workspace"
 	cacheDir   = "./cache"
@@ -38,8 +40,17 @@ const (
 
 	pollTimeout    = 5 * time.Second
 	workerCount    = 5
-	maxRetries     = 3
-	taskTimeoutSec = 3600
+	defaultMaxRetries = 3
+	taskTimeoutSec    = 3600
+
+	baseRetryDelay = 10 * time.Second
+	maxRetryDelay  = 5 * time.Minute
+)
+
+var (
+	ErrNetworkFailure   = errors.New("network failure")
+	ErrTemporaryFailure = errors.New("temporary failure")
+	ErrPermanentFailure = errors.New("permanent failure")
 )
 
 type BuildDetails struct {
@@ -52,9 +63,9 @@ type BuildDetails struct {
 }
 
 type TaskInfo struct {
-	TaskID   string `json:"taskId"`
-	Repo     string `json:"repo"`
-	Branch   string `json:"branch"`
+	TaskID   string   `json:"taskId"`
+	Repo     string   `json:"repo"`
+	Branch   string   `json:"branch"`
 	Commands []string `json:"commands"`
 	Cache    []string `json:"cache"`
 	Timeout  int      `json:"timeout"`
@@ -62,15 +73,16 @@ type TaskInfo struct {
 }
 
 type LogRequest struct {
-	Log    string `json:"log"`
-	Status string `json:"status"`
+	Log        string `json:"log"`
+	Status     string `json:"status"`
+	RetryCount int    `json:"retryCount,omitempty"`
 }
 
 var (
-	redisClient *redis.Client
+	redisClient    *redis.Client
 	runningWorkers int64
-	shutdownChan chan struct{}
-	wg sync.WaitGroup
+	shutdownChan   chan struct{}
+	wg             sync.WaitGroup
 )
 
 func main() {
@@ -102,8 +114,8 @@ func main() {
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"status":    "healthy",
-			"workers":   atomic.LoadInt64(&runningWorkers),
+			"status":  "healthy",
+			"workers": atomic.LoadInt64(&runningWorkers),
 		})
 	})
 
@@ -160,11 +172,19 @@ func pollAndProcessTask(ctx context.Context) error {
 
 	log.Printf("Worker picked up task: %s", taskID)
 
+	taskKey := fmt.Sprintf("task:%s", taskID)
+	retryCountStr, _ := redisClient.HGet(ctx, taskKey, "retryCount").Result()
+	retryCount := 0
+	if retryCountStr != "" {
+		fmt.Sscanf(retryCountStr, "%d", &retryCount)
+	}
+
 	detailsKey := redisQueueDetails + taskID
 	detailsJSON, err := redisClient.LPop(ctx, detailsKey).Result()
 	if err != nil && err != redis.Nil {
 		log.Printf("Failed to get task details for %s: %v", taskID, err)
 		redisClient.LPush(ctx, redisQueueMain, taskID)
+		redisClient.LPush(ctx, detailsKey, "{}")
 		return err
 	}
 
@@ -173,6 +193,7 @@ func pollAndProcessTask(ctx context.Context) error {
 		if err := json.Unmarshal([]byte(detailsJSON), &details); err != nil {
 			log.Printf("Failed to parse task details for %s: %v", taskID, err)
 			redisClient.LPush(ctx, redisQueueMain, taskID)
+			redisClient.LPush(ctx, detailsKey, "{}")
 			return err
 		}
 	}
@@ -187,14 +208,20 @@ func pollAndProcessTask(ctx context.Context) error {
 		Plugins:  details.Plugins,
 	}
 
-	if err := executeBuild(ctx, task); err != nil {
-		log.Printf("Task %s failed: %v", taskID, err)
-		handleTaskFailure(ctx, task)
+	buildErr := executeBuild(ctx, task)
+	if buildErr != nil {
+		log.Printf("Task %s failed: %v", taskID, buildErr)
+		handleTaskFailure(ctx, task, details, buildErr, retryCount)
 	} else {
 		log.Printf("Task %s completed successfully", taskID)
+		removeFromProcessingQueue(ctx, taskID)
 	}
 
 	return nil
+}
+
+func removeFromProcessingQueue(ctx context.Context, taskID string) {
+	redisClient.LRem(ctx, redisQueueProcessing, 0, taskID)
 }
 
 func executeBuild(ctx context.Context, task TaskInfo) error {
@@ -204,7 +231,7 @@ func executeBuild(ctx context.Context, task TaskInfo) error {
 
 	taskDir := filepath.Join(workDir, task.TaskID)
 	if err := os.MkdirAll(taskDir, 0755); err != nil {
-		return fmt.Errorf("failed to create task dir: %w", err)
+		return fmt.Errorf("%w: failed to create task dir", ErrPermanentFailure)
 	}
 	defer os.RemoveAll(taskDir)
 
@@ -221,8 +248,10 @@ func executeBuild(ctx context.Context, task TaskInfo) error {
 	defer cancel()
 
 	if err := runGitClone(buildCtx, taskDir, repoURL, task.Branch); err != nil {
-		updateTaskStatus(ctx, task.TaskID, "failed", fmt.Sprintf("Clone failed: %v", err))
-		return err
+		if isNetworkError(err) {
+			return fmt.Errorf("%w: clone failed: %v", ErrNetworkFailure, err)
+		}
+		return fmt.Errorf("%w: clone failed: %v", ErrTemporaryFailure, err)
 	}
 
 	for _, cachePath := range task.Cache {
@@ -237,8 +266,7 @@ func executeBuild(ctx context.Context, task TaskInfo) error {
 	for _, cmd := range task.Commands {
 		sendLog(task.TaskID, fmt.Sprintf("Executing: %s", cmd))
 		if err := runShellCommand(buildCtx, taskDir, cmd); err != nil {
-			updateTaskStatus(ctx, task.TaskID, "failed", fmt.Sprintf("Command failed: %v", err))
-			return err
+			return fmt.Errorf("%w: command '%s' failed: %v", ErrTemporaryFailure, cmd, err)
 		}
 	}
 
@@ -247,8 +275,7 @@ func executeBuild(ctx context.Context, task TaskInfo) error {
 		pluginPath := filepath.Join(pluginsDir, plugin+".py")
 		if _, err := os.Stat(pluginPath); err == nil {
 			if err := runPythonPlugin(buildCtx, taskDir, pluginPath); err != nil {
-				updateTaskStatus(ctx, task.TaskID, "failed", fmt.Sprintf("Plugin failed: %v", err))
-				return err
+				return fmt.Errorf("%w: plugin '%s' failed: %v", ErrTemporaryFailure, plugin, err)
 			}
 		} else {
 			sendLog(task.TaskID, fmt.Sprintf("Plugin not found: %s", plugin))
@@ -267,29 +294,106 @@ func executeBuild(ctx context.Context, task TaskInfo) error {
 
 	updateTaskStatus(ctx, task.TaskID, "success", "Build completed successfully!")
 	sendLog(task.TaskID, "Build completed successfully!")
+	removeFromProcessingQueue(ctx, task.TaskID)
 	return nil
 }
 
-func handleTaskFailure(ctx context.Context, task TaskInfo) {
-	retryKey := fmt.Sprintf("task:%s:retry", task.TaskID)
-	retryCount, _ := redisClient.Incr(ctx, retryKey).Result()
-	redisClient.Expire(ctx, retryKey, 24*time.Hour)
-
-	if retryCount < maxRetries {
-		log.Printf("Task %s will be retried (attempt %d/%d)", task.TaskID, retryCount, maxRetries)
-		redisClient.LPush(ctx, redisQueueMain, task.TaskID)
-	} else {
-		log.Printf("Task %s exceeded max retries, marking as failed permanently", task.TaskID)
-		updateTaskStatus(ctx, task.TaskID, "failed", fmt.Sprintf("Exceeded max retries (%d)", maxRetries))
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
 	}
+	errStr := err.Error()
+
+	networkIndicators := []string{
+		"connection refused",
+		"connection reset",
+		"connection timed out",
+		"timeout",
+		"no such host",
+		"network",
+		"temporary failure",
+		"i/o timeout",
+		"use of closed",
+		"broken pipe",
+	}
+
+	errLower := strings.ToLower(errStr)
+	for _, indicator := range networkIndicators {
+		if strings.Contains(errLower, indicator) {
+			return true
+		}
+	}
+	return false
 }
 
-func updateTaskStatus(ctx context.Context, taskID, status, logMsg string) error {
-	taskKey := fmt.Sprintf("task:%s", taskID)
-	multi := redisClient.Multi()
+func isPermanentError(err error) bool {
+	return errors.Is(err, ErrPermanentFailure)
+}
 
+func handleTaskFailure(ctx context.Context, task TaskInfo, details BuildDetails, buildErr error, currentRetryCount int) {
+	taskKey := fmt.Sprintf("task:%s", task.TaskID)
+	maxRetries := defaultMaxRetries
+
+	newRetryCount := currentRetryCount + 1
+
+	if errors.Is(buildErr, ErrPermanentFailure) {
+		log.Printf("Task %s failed with permanent error: %v", task.TaskID, buildErr)
+		updateTaskStatusWithRetry(ctx, task.TaskID, "failed", fmt.Sprintf("Build failed: %v", buildErr), newRetryCount)
+		removeFromProcessingQueue(ctx, task.TaskID)
+		return
+	}
+
+	if newRetryCount > maxRetries {
+		log.Printf("Task %s exceeded max retries (%d), marking as failed permanently", task.TaskID, maxRetries)
+		updateTaskStatusWithRetry(ctx, task.TaskID, "failed", fmt.Sprintf("Exceeded max retries (%d): %v", maxRetries, buildErr), newRetryCount)
+		removeFromProcessingQueue(ctx, task.TaskID)
+		return
+	}
+
+	delay := calculateRetryDelay(newRetryCount)
+	log.Printf("Task %s will be retried in %v (attempt %d/%d) - reason: %v",
+		task.TaskID, delay, newRetryCount, maxRetries, buildErr)
+
+	sendLog(task.TaskID, fmt.Sprintf("Build failed (attempt %d/%d): %v. Retrying in %v...",
+		newRetryCount, maxRetries, buildErr, delay))
+
+	go func() {
+		select {
+		case <-time.After(delay):
+			redisClient.HSet(ctx, taskKey, map[string]interface{}{
+				"status":     "pending",
+				"retryCount": newRetryCount,
+				"startedAt":  "",
+				"finishedAt": "",
+			})
+
+			detailsJSON, _ := json.Marshal(details)
+			redisClient.LPush(ctx, redisQueueMain, task.TaskID)
+			redisClient.LPush(ctx, redisQueueDetails+task.TaskID, string(detailsJSON))
+
+			log.Printf("Task %s re-queued for retry %d", task.TaskID, newRetryCount)
+		case <-ctx.Done():
+			log.Printf("Retry for task %s cancelled due to context", task.TaskID)
+		}
+	}()
+}
+
+func calculateRetryDelay(retryCount int) time.Duration {
+	delay := time.Duration(math.Pow(2, float64(retryCount))) * baseRetryDelay
+	if delay > maxRetryDelay {
+		delay = maxRetryDelay
+	}
+	jitter := time.Duration(time.Now().UnixNano()%1000) * time.Millisecond
+	return delay + jitter
+}
+
+func updateTaskStatusWithRetry(ctx context.Context, taskID, status, logMsg string, retryCount int) error {
+	taskKey := fmt.Sprintf("task:%s", taskID)
+
+	multi := redisClient.Multi()
 	multi.HSet(ctx, taskKey, map[string]interface{}{
-		"status": status,
+		"status":     status,
+		"retryCount": retryCount,
 	})
 	multi.HSet(ctx, taskKey, map[string]interface{}{
 		"finishedAt": time.Now().Format(time.RFC3339),
@@ -306,14 +410,19 @@ func updateTaskStatus(ctx context.Context, taskID, status, logMsg string) error 
 		return err
 	}
 
-	reqBody := LogRequest{Status: status}
-	if logMsg != "" {
-		reqBody.Log = logMsg
+	reqBody := LogRequest{
+		Status:     status,
+		Log:        logMsg,
+		RetryCount: retryCount,
 	}
 	jsonData, _ := json.Marshal(reqBody)
 	http.Post(fmt.Sprintf("%s/api/tasks/%s/logs", nodeJSURL, taskID), "application/json", bytes.NewBuffer(jsonData))
 
 	return nil
+}
+
+func updateTaskStatus(ctx context.Context, taskID, status, logMsg string) error {
+	return updateTaskStatusWithRetry(ctx, taskID, status, logMsg, 0)
 }
 
 func sendLog(taskID, message string) {

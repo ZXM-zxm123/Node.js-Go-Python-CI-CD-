@@ -92,7 +92,7 @@ async function initializeTaskInRedis(task) {
     startedAt: null,
     finishedAt: null,
     retryCount: 0,
-    maxRetries: 3
+    maxRetries: task.maxRetries || 3
   };
 
   const multi = redis.multi();
@@ -121,6 +121,7 @@ app.post('/api/pipelines', (req, res) => {
     cache: req.body.cache || [],
     timeout: req.body.timeout || 600,
     plugins: req.body.plugins || [],
+    maxRetries: req.body.maxRetries || 3,
     createdAt: new Date().toISOString()
   };
   pipelines.push(pipeline);
@@ -136,38 +137,14 @@ app.delete('/api/pipelines/:id', (req, res) => {
 
 app.get('/api/tasks', async (req, res) => {
   try {
-    const taskIds = await redis.lrange(REDIS_TASKS_HASH, 0, -1);
+    const taskKeys = await redis.keys('task:*');
     const tasks = [];
+    const validTaskKeys = taskKeys.filter(k => !k.includes(':details:') && !k.includes(':retry'));
 
-    for (const id of taskIds) {
-      const taskKey = `task:${id}`;
+    for (const taskKey of validTaskKeys) {
       const data = await redis.hgetall(taskKey);
       if (data && Object.keys(data).length > 0) {
         tasks.push(deserializeTask(data));
-      }
-    }
-
-    const processingIds = await redis.lrange(REDIS_QUEUE_PROCESSING, 0, -1);
-    for (const id of processingIds) {
-      const taskKey = `task:${id}`;
-      const data = await redis.hgetall(taskKey);
-      if (data && Object.keys(data).length > 0) {
-        const task = deserializeTask(data);
-        if (!tasks.find(t => t.id === id)) {
-          tasks.push(task);
-        }
-      }
-    }
-
-    const mainQueueIds = await redis.lrange(REDIS_QUEUE_MAIN, 0, -1);
-    for (const id of mainQueueIds) {
-      const taskKey = `task:${id}`;
-      const data = await redis.hgetall(taskKey);
-      if (data && Object.keys(data).length > 0) {
-        const task = deserializeTask(data);
-        if (!tasks.find(t => t.id === id)) {
-          tasks.push(task);
-        }
       }
     }
 
@@ -204,6 +181,7 @@ app.post('/api/pipelines/:id/trigger', async (req, res) => {
     cache: pipeline.cache,
     timeout: pipeline.timeout,
     plugins: pipeline.plugins,
+    maxRetries: pipeline.maxRetries || 3,
     createdAt: new Date().toISOString()
   };
 
@@ -257,6 +235,7 @@ app.post('/webhook/github', (req, res) => {
         cache: pipeline.cache,
         timeout: pipeline.timeout,
         plugins: pipeline.plugins,
+        maxRetries: pipeline.maxRetries || 3,
         createdAt: new Date().toISOString()
       };
 
@@ -310,6 +289,7 @@ app.post('/webhook/gitlab', (req, res) => {
         cache: pipeline.cache,
         timeout: pipeline.timeout,
         plugins: pipeline.plugins,
+        maxRetries: pipeline.maxRetries || 3,
         createdAt: new Date().toISOString()
       };
 
@@ -347,21 +327,28 @@ app.post('/api/tasks/:id/logs', async (req, res) => {
 
     if (req.body.log) {
       multi.hincrby(taskKey, 'logCount', 1);
-      const logIndex = await redis.hget(taskKey, 'logCount');
-      multi.hset(taskKey, `log:${logIndex}`, req.body.log);
+      const logCount = await redis.hincrby(taskKey, 'logCount', 0);
+      multi.hset(taskKey, `log:${logCount}`, req.body.log);
     }
 
     if (req.body.status) {
       multi.hset(taskKey, 'status', req.body.status);
 
-      if (req.body.status === 'running' && !await redis.hget(taskKey, 'startedAt')) {
-        multi.hset(taskKey, 'startedAt', new Date().toISOString());
+      if (req.body.status === 'running') {
+        const existingStartedAt = await redis.hget(taskKey, 'startedAt');
+        if (!existingStartedAt || existingStartedAt === '') {
+          multi.hset(taskKey, 'startedAt', new Date().toISOString());
+        }
       }
 
       if (['success', 'failed'].includes(req.body.status)) {
         multi.hset(taskKey, 'finishedAt', new Date().toISOString());
         multi.lrem(REDIS_QUEUE_PROCESSING, 0, taskId);
       }
+    }
+
+    if (typeof req.body.retryCount === 'number') {
+      multi.hset(taskKey, 'retryCount', req.body.retryCount);
     }
 
     await multi.exec();
@@ -402,7 +389,7 @@ function deserializeTask(data) {
     } else if (key === 'logCount') {
       task[key] = parseInt(value);
     } else if (['retryCount', 'maxRetries'].includes(key)) {
-      task[key] = parseInt(value);
+      task[key] = parseInt(value) || 0;
     } else {
       task[key] = value;
     }
@@ -410,7 +397,7 @@ function deserializeTask(data) {
   return task;
 }
 
-const巡检任务 = schedule.scheduleJob('*/30 * * * * *', async () => {
+const periodicCheck = schedule.scheduleJob('*/30 * * * * *', async () => {
   try {
     const processingTasks = await redis.lrange(REDIS_QUEUE_PROCESSING, 0, -1);
     const now = Date.now();
@@ -419,7 +406,7 @@ const巡检任务 = schedule.scheduleJob('*/30 * * * * *', async () => {
       const taskKey = `task:${taskId}`;
       const startedAt = await redis.hget(taskKey, 'startedAt');
 
-      if (startedAt) {
+      if (startedAt && startedAt !== '') {
         const elapsed = (now - new Date(startedAt).getTime()) / 1000;
         const timeout = parseInt(await redis.hget(taskKey, 'timeout') || TASK_TIMEOUT_SECONDS);
 
@@ -435,6 +422,7 @@ const巡检任务 = schedule.scheduleJob('*/30 * * * * *', async () => {
               .hincrby(taskKey, 'retryCount', 1)
               .hset(taskKey, 'status', 'pending')
               .hset(taskKey, 'startedAt', '')
+              .hset(taskKey, 'finishedAt', '')
               .lrem(REDIS_QUEUE_PROCESSING, 0, taskId)
               .lpush(REDIS_QUEUE_MAIN, taskId)
               .lpush(`${REDIS_QUEUE_MAIN}:details:${taskId}`, details || '{}')
@@ -458,7 +446,7 @@ const巡检任务 = schedule.scheduleJob('*/30 * * * * *', async () => {
       }
     }
   } catch (error) {
-    console.error('巡检任务 error:', error);
+    console.error('Periodic check error:', error);
   }
 });
 
@@ -480,19 +468,14 @@ redisSub.on('message', (channel, message) => {
 io.on('connection', (socket) => {
   console.log('Client connected');
 
-  redis.lrange(REDIS_QUEUE_MAIN, 0, -1).then(mainIds => {
-    return Promise.all(mainIds.map(id =>
-      redis.hgetall(`task:${id}`).then(data => data && Object.keys(data).length > 0 ? deserializeTask(data) : null)
-    ));
-  }).then(mainTasks => {
-    return redis.lrange(REDIS_QUEUE_PROCESSING, 0, -1).then(procIds => {
-      return Promise.all(procIds.map(id =>
-        redis.hgetall(`task:${id}`).then(data => data && Object.keys(data).length > 0 ? deserializeTask(data) : null)
-      ));
-    }).then(procTasks => {
-      const allTasks = [...(mainTasks.filter(Boolean)), ...procTasks.filter(Boolean)];
-      socket.emit('initialData', { pipelines, tasks: allTasks.slice(0, 100) });
-    });
+  redis.keys('task:*').then(taskKeys => {
+    const validTaskKeys = taskKeys.filter(k => !k.includes(':details:') && !k.includes(':retry'));
+    return Promise.all(validTaskKeys.map(key =>
+      redis.hgetall(key).then(data => data && Object.keys(data).length > 0 ? deserializeTask(data) : null)
+    );
+  }).then(tasks => {
+    const validTasks = tasks.filter(Boolean).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    socket.emit('initialData', { pipelines, tasks: validTasks.slice(0, 100) });
   }).catch(error => {
     console.error('Error sending initial data:', error);
     socket.emit('initialData', { pipelines, tasks: [] });
