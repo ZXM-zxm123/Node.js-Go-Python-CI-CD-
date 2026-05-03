@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CI/CD 系统</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>CI/CD 系统</h1>
+    </header>
+
+    <div class="main-grid">
+      <div class="card">
+        <div class="card-header">
+          <h2>流水线配置</h2>
+          <button id="addPipelineBtn" class="btn btn-primary">+ 新建流水线</button>
+        </div>
+        <div id="pipelineList" class="pipeline-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>任务记录</h2>
+        </div>
+        <div id="taskList" class="task-list"></div>
+      </div>
+
+      <div class="card full-width">
+        <div class="card-header">
+          <h2>构建日志</h2>
+        </div>
+        <div id="logViewer" class="log-viewer">
+          <pre><code id="logContent">选择一个任务查看日志...</code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="pipelineModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>新建流水线</h3>
+        <button class="close-btn">&times;</button>
+      </div>
+      <form id="pipelineForm">
+        <div class="form-group">
+          <label>流水线名称</label>
+          <input type="text" id="pipelineName" required>
+        </div>
+        <div class="form-group">
+          <label>Git 仓库</label>
+          <input type="text" id="pipelineRepo" placeholder="owner/repo" required>
+        </div>
+        <div class="form-group">
+          <label>分支</label>
+          <input type="text" id="pipelineBranch" placeholder="main (或 * 表示所有分支)" value="main">
+        </div>
+        <div class="form-group">
+          <label>构建命令（每行一个）</label>
+          <textarea id="pipelineCommands" rows="5" placeholder="npm install&#10;npm test&#10;npm run build"></textarea>
+        </div>
+        <div class="form-group">
+          <label>缓存目录（每行一个）</label>
+          <textarea id="pipelineCache" rows="3" placeholder="node_modules"></textarea>
+        </div>
+        <div class="form-group">
+          <label>超时（秒）</label>
+          <input type="number" id="pipelineTimeout" value="600">
+        </div>
+        <div class="form-group">
+          <label>插件（每行一个）</label>
+          <textarea id="pipelinePlugins" rows="3" placeholder="unittest&#10;dependency-scan"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">保存</button>
+      </form>
+    </div>
+  </div>
+
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
