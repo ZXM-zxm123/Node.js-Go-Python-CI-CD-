@@ -17,8 +17,21 @@
 │  │  • Express Web 服务器                             │ │
 │  │  • Socket.IO 实时通信                              │ │
 │  │  • 流水线配置管理                                  │ │
-│  │  • 任务记录存储                                    │ │
+│  │  • 任务记录存储 → Redis                            │ │
 │  │  • GitHub/GitLab Webhook 接收                      │ │
+│  │  • 背压控制 (队列长度限制)                          │ │
+│  │  • 超时巡检机制                                    │ │
+│  └───────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│                      Redis (6379)                       │
+│  ┌───────────────────────────────────────────────────┐ │
+│  │  • ci:tasks:main (List) - 主任务队列              │ │
+│  │  • ci:tasks:processing (List) - 处理中队列         │ │
+│  │  • ci:tasks:main:details:* (List) - 任务详情      │ │
+│  │  • task:* (Hash) - 任务状态                        │ │
 │  └───────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────┘
                             │
@@ -26,12 +39,16 @@
 ┌─────────────────────────────────────────────────────────┐
 │                  Go 构建执行器 (8080)                   │
 │  ┌───────────────────────────────────────────────────┐ │
+│  │  • 多 Worker 并发处理 (默认 5 个)                   │ │
+│  │  • BRPOPLPUSH 事务性拉取                           │ │
 │  │  • Git 仓库拉取                                    │ │
 │  │  • 用户命令执行                                    │ │
 │  │  • 构建缓存支持                                    │ │
 │  │  • 超时控制                                        │ │
 │  │  • Python 插件调用                                 │ │
 │  │  • 实时日志流传输                                  │ │
+│  │  • 自动重试机制                                    │ │
+│  │  • 健康检查                                        │ │
 │  └───────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────┘
                             │
@@ -45,6 +62,26 @@
 └─────────────────────────────────────────────────────────┘
 ```
 
+## 核心修复：任务调度可靠性
+
+### 问题
+同时触发大量任务时，部分任务未被调度（丢失）。
+
+### 原因
+原设计使用内存 channel，Go 服务通过 HTTP 调用获取任务，存在以下问题：
+1. 内存 channel 在 Go 重启时会丢失
+2. 没有事务性拉取，并发时会出现竞争
+3. 缺少重试和巡检机制
+
+### 解决方案
+使用 Redis 作为持久化存储和消息队列：
+
+1. **立即持久化**：Node.js 接收任务后立即写入 Redis（LPUSH），状态为 pending
+2. **事务性拉取**：Go 使用 `BRPOPLPUSH` 从主队列移到处理队列，确保不丢失
+3. **超时重试**：任务超时后自动移回主队列重试（默认 3 次）
+4. **定期巡检**：Node.js 每 30 秒检查处理中的任务，超时则重试
+5. **背压控制**：队列超过阈值（80%）拒绝新任务
+
 ## 功能特性
 
 - ✅ 流水线配置管理（创建、删除）
@@ -57,17 +94,21 @@
 - ✅ 实时日志流
 - ✅ Python 插件系统
 - ✅ Web 前端界面
+- ✅ **Redis 持久化存储**
+- ✅ **事务性任务拉取**
+- ✅ **超时自动重试**
+- ✅ **背压控制**
+- ✅ **多 Worker 并发处理**
 
-## 快速开始
-
-### 前置要求
+## 前置要求
 
 - Node.js 16+
 - Go 1.21+
 - Python 3.7+
 - Git
+- Redis 6+
 
-### 启动
+## 启动
 
 **Windows:**
 ```cmd
@@ -82,14 +123,19 @@ chmod +x start.sh
 
 ### 手动启动
 
-**1. 启动 Node.js 服务:**
+**1. 启动 Redis:**
+```bash
+redis-server
+```
+
+**2. 启动 Node.js 服务:**
 ```bash
 cd nodejs-service
 npm install
 npm start
 ```
 
-**2. 启动 Go 构建器 (新开终端):**
+**3. 启动 Go 构建器 (新开终端):**
 ```bash
 cd go-builder
 go mod tidy
@@ -100,39 +146,72 @@ go run main.go
 
 打开浏览器访问: http://localhost:3000
 
-## 使用说明
+## 配置说明
 
-### 1. 创建流水线
+### 环境变量
 
-点击 "新建流水线" 按钮，填写：
-- 流水线名称
-- Git 仓库（格式：`owner/repo` 或 `gitlab.com/owner/repo`）
-- 分支（默认 `main`，`*` 表示所有分支）
-- 构建命令（每行一个）
-- 缓存目录（每行一个，可选）
-- 超时时间（秒，默认 600）
-- 插件（每行一个，可选）
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| REDIS_HOST | localhost | Redis 主机 |
+| REDIS_PORT | 6379 | Redis 端口 |
 
-### 2. 手动触发
+### Go Builder 参数
 
-点击流水线卡片上的 "触发构建" 按钮即可。
+```go
+workerCount    = 5     // 并发 Worker 数量
+maxRetries     = 3     // 最大重试次数
+taskTimeoutSec = 3600  // 任务超时（秒）
+pollTimeout    = 5s    // 队列轮询超时
+```
 
-### 3. Webhook 配置
+### 背压控制
 
-**GitHub:**
-- 仓库设置 → Webhooks → Add webhook
-- Payload URL: `http://your-server:3000/webhook/github`
-- Content type: `application/json`
-- 事件选择: Just the push event
+```go
+MAX_QUEUE_SIZE = 10000  // 最大队列长度
+```
 
-**GitLab:**
-- 仓库设置 → Integrations
-- URL: `http://your-server:3000/webhook/gitlab`
-- 触发事件: Push events
+当队列长度超过 80% 时，Webhook 会拒绝新任务。
 
-### 4. 查看日志
+## API 接口
 
-点击任务记录卡片即可查看实时构建日志。
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /api/pipelines | 获取所有流水线 |
+| POST | /api/pipelines | 创建流水线 |
+| DELETE | /api/pipelines/:id | 删除流水线 |
+| POST | /api/pipelines/:id/trigger | 触发流水线构建 |
+| GET | /api/tasks | 获取所有任务 |
+| POST | /api/tasks/:id/logs | 发送构建日志 |
+| GET | /api/queue/status | 获取队列状态 |
+| POST | /webhook/github | GitHub Webhook |
+| POST | /webhook/gitlab | GitLab Webhook |
+
+## Redis 数据结构
+
+### 主队列 `ci:tasks:main`
+```
+LPUSH taskId  // 添加任务
+BRPOPLPUSH ci:tasks:main ci:tasks:processing 0  // 原子性拉取
+```
+
+### 处理队列 `ci:tasks:processing`
+```
+任务详情队列 (atomic push from main)
+```
+
+### 任务详情 `ci:tasks:main:details:{taskId}`
+```
+LPUSH '{"repo":"...","branch":"main",...}'
+LPOP // 消费
+```
+
+### 任务状态 `task:{taskId}`
+```
+HSET status "pending|running|success|failed"
+HSET startedAt "2024-01-01T00:00:00Z"
+HSET finishedAt "2024-01-01T00:05:00Z"
+HSET retryCount 0
+```
 
 ## 目录结构
 
@@ -156,19 +235,6 @@ go run main.go
 ├── start.sh               # Linux/Mac 启动脚本
 └── README.md              # 文档
 ```
-
-## API 接口
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /api/pipelines | 获取所有流水线 |
-| POST | /api/pipelines | 创建流水线 |
-| DELETE | /api/pipelines/:id | 删除流水线 |
-| POST | /api/pipelines/:id/trigger | 触发流水线构建 |
-| GET | /api/tasks | 获取所有任务 |
-| POST | /api/tasks/:id/logs | 发送构建日志 |
-| POST | /webhook/github | GitHub Webhook |
-| POST | /webhook/gitlab | GitLab Webhook |
 
 ## 开发插件
 
